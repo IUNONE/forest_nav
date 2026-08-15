@@ -57,58 +57,26 @@ validation split，六个 bag 中通过过滤的约 1902 条样本全部用于�
 由于录制数据不包含 `body -> D435i_front_link` 外参，可视化脚本只分别显示 RGB 与
 body local-frame 轨迹，不把轨迹伪精确地投影到图像上。
 
-## 写入推理轨迹并用 Rerun 查看
+## 用 Rerun 查看规划轨迹
 
-训练完成后，可将六个原始 MCAP 流式复制到新目录，并以 10 Hz 写入8个规划话题：
-
-```bash
-python rerun_visualize.py \
-  --input /data/rosbag2 \
-  --output /data/zhangshenghong/datasets/rosbag2_planned \
-  --checkpoint results/resnet50_spatial
-```
-
-输入文件不会被原地修改。目录输入会生成例如
-`rosbag2_planned/exp2/exp2_0_planned.mcap` 的文件。输出保留所有原始 schema、channel、
-message、attachment 和 metadata，因此需要预留接近原始六个 bag 总大小的额外磁盘空间。
-
-转换器还会写入 `/robot_description`（`std_msgs/msg/String`）以及一条新增的
-`/tf_static` 消息。机器人模型来自
-`assets/diablo_original/urdf/diablo_forest_nav.urdf`：它在上游模型基础上增加了
-`body -> base_link` 零偏移固定关节，并包含其余14条关节固定姿态。原始 bag 已有动态
-`camera_init -> body`，所以机器人、地图点云和规划轨迹位于同一 TF 树中。
-
-新增话题为：
-
-- `/planned_trajectory_final`
-- `/planned_trajectory_opt1` 至 `/planned_trajectory_opt7`
-
-消息采用 `sensor_msgs/msg/PointCloud2`，每条消息包含32个轨迹点。Rerun 可将该标准消息
-自动显示为 `Points3D`；`nav_msgs/Path` 当前不能被 Rerun 自动转换为空间轨迹。点坐标已经
-从图像时刻的 `body` 局部坐标系转换到实际 odometry reference frame `camera_init`。
-
-默认 `opt1` 至 `opt7` 使用 seed `0..6` 和4步快速扩散。`final` 使用 checkpoint 配置中的
-完整10步扩散，并在相同7个 seed 的候选中选择与未来 odometry 真值平均点误差最小的一条。
-因此 `final` 是带真值信息的离线 oracle 可视化结果，不能用作在线部署方法。在 odometry
-真值无效或不足3.2秒时，脚本回退到第一个 full-step 候选，并在 MCAP metadata 中记录原因。
-
-Rerun 0.36 需要 Python 3.10，不能安装到训练使用的 Python 3.8 环境。首次使用时创建独立
-环境：
+可视化环境沿用 Rerun 0.24。首次使用时创建独立环境：
 
 ```bash
 conda env create -f rerun_env.yaml
 ```
 
-然后用脚本的 `view` 子命令打开一个转换后的 bag：
+打开一个包含传感器、TF、Odometry 和规划轨迹的 MCAP 或 rosbag2 目录：
 
 ```bash
-conda run -n rerun_viz python rerun_visualize.py view \
-  --input /data/zhangshenghong/datasets/rosbag2_planned/exp2/exp2_0_planned.mcap
+conda run -n rerun python rerun_visualize.py \
+  --bag-name /data/zhangshenghong/datasets/rosbag2_planned/exp2/exp2_0_planned.mcap
 ```
 
-该布局左侧为3D点云/轨迹/URDF，target frame 固定为 `body`；机器人保持在视图原点，
-地图和点云相对机器人移动。右侧显示前视 RGB。这里固定的是空间参考系，不是简单锁定
-相机屏幕坐标，因此旋转时的方向关系仍然正确。
+脚本识别 `/planned_trajectory_final` 和 `/planned_trajectory_opt1` 至
+`/planned_trajectory_opt7`，支持 `sensor_msgs/msg/PointCloud2` 和 `nav_msgs/msg/Path`。
+`final` 显示为亮黄色粗线，七条 `opt` 使用不同暗色细线。
 
-可以通过 `--opt-steps`、`--final-steps`、`--seeds`、`--device` 和 `--max-frames`
-调整推理行为。`--max-frames` 只限制推理帧数，原始 MCAP 消息仍会被完整复制。
+左侧三维窗口以 Odometry child frame（通常为 `body`）为固定坐标系。机器人 URDF 从
+`assets/diablo_original/urdf/diablo_forest_nav.urdf` 加载并保持在原点，点云、历史/未来
+轨迹、规划轨迹和相机模型均逐帧转换到该坐标系。可用 `--robot-frame` 或
+`--robot-urdf` 覆盖默认值；右侧 RGB、深度、俯视轨迹和速度面板保留原布局。

@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""Visualize ROS 2 bags in Rerun with a robot-centered 3D scene.
-
-The left view keeps the URDF robot at the origin while point clouds, recorded
-motion, camera geometry, and planned trajectories move in the robot frame.
-"""
-
-from __future__ import annotations
-
 import argparse
 import bisect
 import math
@@ -15,7 +6,6 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
-from xml.etree import ElementTree
 
 import numpy as np
 import rerun as rr
@@ -30,32 +20,6 @@ COLOR_CURRENT = np.array([239, 83, 80], dtype=np.uint8)
 COLOR_FULL_PATH = np.array([120, 132, 158], dtype=np.uint8)
 COLOR_VX = np.array([41, 182, 246], dtype=np.uint8)
 COLOR_VY = np.array([255, 112, 67], dtype=np.uint8)
-PLANNED_TRAJECTORY_TOPICS = ("/planned_trajectory_final",) + tuple(
-    f"/planned_trajectory_opt{index}" for index in range(1, 8)
-)
-COLOR_PLANNED_FINAL = np.array([255, 245, 70], dtype=np.uint8)
-COLORS_PLANNED_OPT = (
-    np.array([70, 105, 165], dtype=np.uint8),
-    np.array([55, 125, 130], dtype=np.uint8),
-    np.array([70, 130, 85], dtype=np.uint8),
-    np.array([115, 85, 145], dtype=np.uint8),
-    np.array([145, 75, 115], dtype=np.uint8),
-    np.array([150, 95, 55], dtype=np.uint8),
-    np.array([95, 105, 120], dtype=np.uint8),
-)
-PLANNED_FINAL_RADIUS = 0.045
-PLANNED_OPT_RADIUS = 0.016
-SUPPORTED_PLANNED_TRAJECTORY_TYPES = {
-    "sensor_msgs/msg/PointCloud2",
-    "nav_msgs/msg/Path",
-}
-DEFAULT_ROBOT_URDF = (
-    Path(__file__).resolve().parent
-    / "assets"
-    / "diablo_original"
-    / "urdf"
-    / "diablo_forest_nav.urdf"
-)
 
 
 @dataclass(frozen=True)
@@ -69,7 +33,6 @@ class TopicSelection:
     color_camera_info: str | None
     tf: str | None
     tf_static: str | None
-    planned_trajectories: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -112,27 +75,6 @@ class PointCloudDescription:
     fields: tuple[str, ...]
     point_step: int
     point_count: int
-
-
-@dataclass(frozen=True)
-class RobotVisual:
-    """保存一个已经展开到 URDF 根坐标系的机器人网格."""
-
-    link_name: str
-    visual_index: int
-    mesh_path: Path
-    root_from_visual: np.ndarray
-    scale_xyz: np.ndarray
-    color_rgba: np.ndarray | None
-
-
-@dataclass(frozen=True)
-class RobotModel:
-    """保存 URDF 根 link 和全部可显示网格."""
-
-    urdf_path: Path
-    root_link: str
-    visuals: tuple[RobotVisual, ...]
 
 
 @dataclass(frozen=True)
@@ -413,197 +355,6 @@ def make_transform(
     return matrix
 
 
-def parse_float_vector(
-    value: str | None,
-    length: int,
-    default: Sequence[float],
-    label: str,
-) -> np.ndarray:
-    """解析 URDF 中以空格分隔的定长浮点向量."""
-    if value is None:
-        return np.asarray(default, dtype=np.float64)
-    try:
-        parsed = np.asarray([float(item) for item in value.split()], dtype=np.float64)
-    except ValueError as error:
-        raise ValueError(f"URDF {label} 包含非数值内容: {value!r}") from error
-    if parsed.shape != (length,) or not np.isfinite(parsed).all():
-        raise ValueError(f"URDF {label} 必须包含 {length} 个有限数值: {value!r}")
-    return parsed
-
-
-def transform_from_urdf_origin(origin: Any | None) -> np.ndarray:
-    """将 URDF origin 的 xyz/rpy 转换为 parent_from_child 矩阵."""
-    if origin is None:
-        xyz = np.zeros(3, dtype=np.float64)
-        rpy = np.zeros(3, dtype=np.float64)
-    else:
-        xyz = parse_float_vector(origin.get("xyz"), 3, [0.0] * 3, "origin xyz")
-        rpy = parse_float_vector(origin.get("rpy"), 3, [0.0] * 3, "origin rpy")
-    roll, pitch, yaw = rpy
-    cr, sr = math.cos(roll), math.sin(roll)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    rotation = np.array(
-        [
-            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
-            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
-            [-sp, cp * sr, cp * cr],
-        ],
-        dtype=np.float64,
-    )
-    matrix = np.eye(4, dtype=np.float64)
-    matrix[:3, :3] = rotation
-    matrix[:3, 3] = xyz
-    return matrix
-
-
-def resolve_urdf_asset_path(urdf_path: Path, filename: str) -> Path:
-    """解析 URDF mesh 路径并拒绝当前工程无法定位的 package URI."""
-    if filename.startswith("package://"):
-        raise ValueError(
-            f"URDF mesh 使用了无法自动定位的 package URI: {filename}"
-        )
-    if filename.startswith("file://"):
-        asset_path = Path(filename[7:])
-    else:
-        asset_path = Path(filename)
-        if not asset_path.is_absolute():
-            asset_path = urdf_path.parent / asset_path
-    asset_path = asset_path.expanduser().resolve()
-    if not asset_path.is_file():
-        raise FileNotFoundError(f"URDF mesh 不存在: {asset_path}")
-    return asset_path
-
-
-def material_color(
-    visual: Any,
-    named_materials: dict[str, np.ndarray],
-) -> np.ndarray | None:
-    """读取 visual 的内联或具名材质颜色并转换为 uint8 RGBA."""
-    material = visual.find("material")
-    if material is None:
-        return None
-    color = material.find("color")
-    if color is not None:
-        rgba = parse_float_vector(
-            color.get("rgba"),
-            4,
-            [1.0] * 4,
-            "material rgba",
-        )
-        return np.rint(np.clip(rgba, 0.0, 1.0) * 255.0).astype(np.uint8)
-    name = material.get("name")
-    return named_materials.get(name) if name else None
-
-
-def load_robot_model(urdf_path: Path) -> RobotModel:
-    """解析 URDF，并在所有可动关节取零值时展开 link/visual 位姿."""
-    urdf_path = urdf_path.expanduser().resolve()
-    if not urdf_path.is_file():
-        raise FileNotFoundError(f"机器人 URDF 不存在: {urdf_path}")
-    try:
-        robot = ElementTree.parse(urdf_path).getroot()
-    except ElementTree.ParseError as error:
-        raise ValueError(f"机器人 URDF 无法解析: {urdf_path}: {error}") from error
-    if robot.tag != "robot":
-        raise ValueError(f"URDF 根元素不是 <robot>: {urdf_path}")
-
-    link_elements = {
-        str(link.get("name")): link
-        for link in robot.findall("link")
-        if link.get("name")
-    }
-    if not link_elements:
-        raise ValueError(f"URDF 不包含具名 link: {urdf_path}")
-    child_to_joint: dict[str, tuple[str, np.ndarray]] = {}
-    for joint in robot.findall("joint"):
-        parent = joint.find("parent")
-        child = joint.find("child")
-        parent_name = parent.get("link") if parent is not None else None
-        child_name = child.get("link") if child is not None else None
-        if parent_name not in link_elements or child_name not in link_elements:
-            name = joint.get("name", "<unnamed>")
-            raise ValueError(f"URDF joint {name} 引用了不存在的 link")
-        if child_name in child_to_joint:
-            raise ValueError(f"URDF link 有多个父 joint: {child_name}")
-        child_to_joint[child_name] = (
-            parent_name,
-            transform_from_urdf_origin(joint.find("origin")),
-        )
-
-    root_links = sorted(set(link_elements) - set(child_to_joint))
-    if len(root_links) != 1:
-        raise ValueError(f"URDF 必须恰好有一个根 link，实际为: {root_links}")
-    root_link = root_links[0]
-    root_from_link = {root_link: np.eye(4, dtype=np.float64)}
-    unresolved = dict(child_to_joint)
-    while unresolved:
-        progress = False
-        for child_name, (parent_name, parent_from_child) in tuple(
-            unresolved.items()
-        ):
-            if parent_name not in root_from_link:
-                continue
-            root_from_link[child_name] = (
-                root_from_link[parent_name] @ parent_from_child
-            )
-            del unresolved[child_name]
-            progress = True
-        if not progress:
-            raise ValueError(
-                "URDF joint 图不连通或包含环: " + ", ".join(sorted(unresolved))
-            )
-
-    named_materials: dict[str, np.ndarray] = {}
-    for material in robot.findall("material"):
-        name = material.get("name")
-        color = material.find("color")
-        if name and color is not None:
-            rgba = parse_float_vector(
-                color.get("rgba"), 4, [1.0] * 4, "material rgba"
-            )
-            named_materials[name] = np.rint(
-                np.clip(rgba, 0.0, 1.0) * 255.0
-            ).astype(np.uint8)
-
-    visuals: list[RobotVisual] = []
-    for link_name, link in link_elements.items():
-        for visual_index, visual in enumerate(link.findall("visual")):
-            geometry = visual.find("geometry")
-            mesh = geometry.find("mesh") if geometry is not None else None
-            if mesh is None or not mesh.get("filename"):
-                raise ValueError(
-                    f"URDF {link_name} visual {visual_index} 不是有效 mesh"
-                )
-            scale = parse_float_vector(
-                mesh.get("scale"), 3, [1.0] * 3, "mesh scale"
-            )
-            if np.any(scale <= 0.0):
-                raise ValueError(f"URDF mesh scale 必须大于零: {scale.tolist()}")
-            visuals.append(
-                RobotVisual(
-                    link_name=link_name,
-                    visual_index=visual_index,
-                    mesh_path=resolve_urdf_asset_path(
-                        urdf_path, str(mesh.get("filename"))
-                    ),
-                    root_from_visual=(
-                        root_from_link[link_name]
-                        @ transform_from_urdf_origin(visual.find("origin"))
-                    ),
-                    scale_xyz=scale,
-                    color_rgba=material_color(visual, named_materials),
-                )
-            )
-    if not visuals:
-        raise ValueError(f"URDF 不包含可显示 mesh: {urdf_path}")
-    return RobotModel(
-        urdf_path=urdf_path,
-        root_link=root_link,
-        visuals=tuple(visuals),
-    )
-
-
 def rigid_inverse(matrix: np.ndarray) -> np.ndarray:
     """计算刚体齐次变换的高效逆矩阵."""
     matrix = np.asarray(matrix, dtype=np.float64)
@@ -784,29 +535,10 @@ def discover_topics(
 ) -> TopicSelection:
     """根据 ROS 消息类型和名称发现可视化 topic."""
     by_type: dict[str, list[str]] = defaultdict(list)
-    type_by_topic: dict[str, str] = {}
     for connection in connections:
         by_type[connection.msgtype].append(connection.topic)
-        type_by_topic[connection.topic] = connection.msgtype
-    planned_trajectories: list[str] = []
-    for topic in PLANNED_TRAJECTORY_TOPICS:
-        msgtype = type_by_topic.get(topic)
-        if msgtype is None:
-            continue
-        if msgtype not in SUPPORTED_PLANNED_TRAJECTORY_TYPES:
-            supported = ", ".join(sorted(SUPPORTED_PLANNED_TRAJECTORY_TYPES))
-            raise ValueError(
-                f"规划轨迹 {topic} 使用了不支持的消息类型 {msgtype}; "
-                f"支持: {supported}"
-            )
-        planned_trajectories.append(topic)
-    pointcloud_candidates = [
-        topic
-        for topic in by_type["sensor_msgs/msg/PointCloud2"]
-        if topic not in PLANNED_TRAJECTORY_TOPICS
-    ]
     pointcloud = choose_topic(
-        pointcloud_candidates,
+        by_type["sensor_msgs/msg/PointCloud2"],
         arguments.pointcloud_topic,
         "PointCloud2",
         [
@@ -887,7 +619,6 @@ def discover_topics(
         color_camera_info=color_camera_info,
         tf=tf,
         tf_static=tf_static,
-        planned_trajectories=tuple(planned_trajectories),
     )
 
 
@@ -1292,49 +1023,6 @@ def decode_pointcloud(
     return positions, colors
 
 
-def decode_planned_trajectory(
-    message: Any,
-    msgtype: str,
-) -> tuple[np.ndarray, str]:
-    """将 PointCloud2 或 nav_msgs/Path 规划结果解码为三维折线."""
-    if msgtype == "sensor_msgs/msg/PointCloud2":
-        points, _ = decode_pointcloud(message, stride=1)
-        frame_id = clean_frame_id(message.header.frame_id)
-    elif msgtype == "nav_msgs/msg/Path":
-        points = np.asarray(
-            [
-                [
-                    float(pose.pose.position.x),
-                    float(pose.pose.position.y),
-                    float(pose.pose.position.z),
-                ]
-                for pose in message.poses
-            ],
-            dtype=np.float32,
-        ).reshape(-1, 3)
-        valid = np.isfinite(points).all(axis=1)
-        points = points[valid]
-        frame_id = clean_frame_id(message.header.frame_id)
-        if not frame_id and len(message.poses) > 0:
-            frame_id = clean_frame_id(message.poses[0].header.frame_id)
-    else:
-        raise ValueError(f"不支持的规划轨迹消息类型: {msgtype}")
-    if not frame_id:
-        raise ValueError("规划轨迹消息的 frame_id 为空")
-    return points, frame_id
-
-
-def planned_trajectory_style(topic: str) -> tuple[np.ndarray, float, str]:
-    """返回规划 topic 对应的颜色、线宽和显示名."""
-    if topic == PLANNED_TRAJECTORY_TOPICS[0]:
-        return COLOR_PLANNED_FINAL, PLANNED_FINAL_RADIUS, "final"
-    try:
-        index = PLANNED_TRAJECTORY_TOPICS.index(topic) - 1
-    except ValueError as error:
-        raise ValueError(f"未知规划轨迹 topic: {topic}") from error
-    return COLORS_PLANNED_OPT[index], PLANNED_OPT_RADIUS, f"opt{index + 1}"
-
-
 def transform_points(points: np.ndarray, target_from_source: np.ndarray) -> np.ndarray:
     """将三维点批量变换到目标坐标系."""
     rotation = target_from_source[:3, :3]
@@ -1412,17 +1100,14 @@ def decode_ros_image(message: Any) -> tuple[np.ndarray, str]:
 def build_blueprint() -> rrb.Blueprint:
     """构建左侧三维视图和右侧传感器及状态面板布局."""
     pointcloud_view = rrb.Spatial3DView(
-        name="Robot-centered point cloud + planned trajectories",
+        name="Point cloud + 1 s history + 2 s future",
         origin="/world",
         contents=[
             "/world/pointcloud",
             "/world/trajectory/**",
-            "/world/planned_trajectories/**",
-            "/world/robot_model/**",
             "/world/camera/**",
         ],
         line_grid=True,
-        eye_controls=rrb.EyeControls3D(speed=2.0),
     )
     rgb_view = rrb.Spatial2DView(
         name="RGB",
@@ -1463,38 +1148,12 @@ def build_blueprint() -> rrb.Blueprint:
     )
 
 
-def log_robot_model(robot_model: RobotModel) -> None:
-    """在机器人中心坐标原点记录 URDF 的全部静态 STL visual."""
-    for visual in robot_model.visuals:
-        safe_link_name = visual.link_name.replace("/", "_")
-        entity_path = (
-            f"world/robot_model/{safe_link_name}/visual_{visual.visual_index}"
-        )
-        rr.log(
-            entity_path,
-            rr.Transform3D(
-                translation=visual.root_from_visual[:3, 3],
-                quaternion=rr.Quaternion(
-                    xyzw=matrix_to_quaternion(visual.root_from_visual)
-                ),
-                scale=visual.scale_xyz,
-            ),
-            rr.Asset3D(
-                path=str(visual.mesh_path),
-                albedo_factor=visual.color_rgba,
-            ),
-            static=True,
-        )
-
-
 def log_static_scene(
     inspection: BagInspection,
     velocity_source: str,
-    robot_model: RobotModel,
 ) -> None:
     """记录坐标系, 相机模型, 全局轨迹和曲线样式."""
     rr.log("world", rr.ViewCoordinates.FLU, static=True)
-    log_robot_model(robot_model)
     calibration = inspection.calibration
     rr.log(
         "world/camera",
@@ -1599,9 +1258,8 @@ def log_trajectory_state(
     timestamp_ns: int,
     history_seconds: float,
     future_seconds: float,
-    robot_from_root: np.ndarray | None,
-) -> bool:
-    """记录机器人中心三维轨迹、全局俯视轨迹和当前速度."""
+) -> None:
+    """记录三维和俯视轨迹窗口以及当前速度."""
     history, future, index = trajectory_window(
         odometry,
         timestamp_ns,
@@ -1611,40 +1269,45 @@ def log_trajectory_state(
     current = odometry.positions[index]
     rotation = quaternion_to_matrix(odometry.quaternions_xyzw[index])[:3, :3]
     heading = rotation[:, 0] * 0.55
-    if robot_from_root is not None:
-        centered_history = transform_points(history, robot_from_root)
-        centered_future = transform_points(future, robot_from_root)
-        centered_current = transform_points(current[None, :], robot_from_root)[0]
-        centered_heading = robot_from_root[:3, :3] @ heading
-        rr.log(
-            "world/trajectory/history_1s",
-            rr.LineStrips3D(
-                [centered_history],
-                colors=[COLOR_HISTORY],
-                radii=0.035,
-                labels=[f"History {history_seconds:g} s"],
-                show_labels=False,
-            ),
-        )
-        rr.log(
-            "world/trajectory/future_2s",
-            rr.LineStrips3D(
-                [centered_future],
-                colors=[COLOR_FUTURE],
-                radii=0.035,
-                labels=[f"Future {future_seconds:g} s"],
-                show_labels=False,
-            ),
-        )
-        rr.log(
-            "world/trajectory/heading",
-            rr.Arrows3D(
-                origins=[centered_current],
-                vectors=[centered_heading],
-                colors=[COLOR_CURRENT],
-                radii=0.018,
-            ),
-        )
+    rr.log(
+        "world/trajectory/history_1s",
+        rr.LineStrips3D(
+            [history],
+            colors=[COLOR_HISTORY],
+            radii=0.035,
+            labels=[f"History {history_seconds:g} s"],
+            show_labels=False,
+        ),
+    )
+    rr.log(
+        "world/trajectory/future_2s",
+        rr.LineStrips3D(
+            [future],
+            colors=[COLOR_FUTURE],
+            radii=0.035,
+            labels=[f"Future {future_seconds:g} s"],
+            show_labels=False,
+        ),
+    )
+    rr.log(
+        "world/trajectory/robot",
+        rr.Points3D(
+            [current],
+            colors=[COLOR_CURRENT],
+            radii=0.11,
+            labels=["Robot"],
+            show_labels=False,
+        ),
+    )
+    rr.log(
+        "world/trajectory/heading",
+        rr.Arrows3D(
+            origins=[current],
+            vectors=[heading],
+            colors=[COLOR_CURRENT],
+            radii=0.025,
+        ),
+    )
     rr.log(
         "dashboard/top_down/history_1s",
         rr.LineStrips2D(
@@ -1687,25 +1350,24 @@ def log_trajectory_state(
     velocity = odometry.display_velocities_xy[index]
     rr.log("dashboard/velocity/vx", rr.Scalars(float(velocity[0])))
     rr.log("dashboard/velocity/vy", rr.Scalars(float(velocity[1])))
-    return robot_from_root is not None
 
 
 def log_camera_pose(
     resolver: FrameResolver,
-    robot_frame: str,
+    root_frame: str,
     camera_frame: str,
     timestamp_ns: int,
 ) -> bool:
-    """解析并记录相机 optical frame 在机器人中心坐标中的姿态."""
-    robot_from_camera = resolver.lookup(robot_frame, camera_frame, timestamp_ns)
-    if robot_from_camera is None:
+    """解析并记录相机 optical frame 在世界坐标中的姿态."""
+    world_from_camera = resolver.lookup(root_frame, camera_frame, timestamp_ns)
+    if world_from_camera is None:
         return False
     rr.log(
         "world/camera",
         rr.Transform3D(
-            translation=robot_from_camera[:3, 3],
+            translation=world_from_camera[:3, 3],
             quaternion=rr.Quaternion(
-                xyzw=matrix_to_quaternion(robot_from_camera)
+                xyzw=matrix_to_quaternion(world_from_camera)
             ),
             axis_length=0.25,
         ),
@@ -1718,8 +1380,6 @@ def render_bag(
     resolver: FrameResolver,
     aliases: dict[str, str],
     camera_frame: str,
-    robot_frame: str,
-    robot_model: RobotModel,
     arguments: argparse.Namespace,
 ) -> None:
     """按 bag 记录时间流式写入 Rerun 数据和布局."""
@@ -1734,11 +1394,7 @@ def render_bag(
     if arguments.save is not None:
         arguments.save.parent.mkdir(parents=True, exist_ok=True)
         rr.save(arguments.save, default_blueprint=blueprint)
-    log_static_scene(
-        inspection,
-        inspection.odometry.velocity_source,
-        robot_model,
-    )
+    log_static_scene(inspection, inspection.odometry.velocity_source)
     root_frame = canonical_frame_id(inspection.odometry.root_frame, aliases)
     start_ns = inspection.start_ns + int(
         arguments.start_seconds * NANOSECONDS_PER_SECOND
@@ -1756,7 +1412,6 @@ def render_bag(
         inspection.topics.depth,
         inspection.topics.odometry,
     }
-    selected_topics.update(inspection.topics.planned_trajectories)
     counters: Counter[str] = Counter()
     warnings: Counter[str] = Counter()
     with AnyReader([inspection.bag_path]) as reader:
@@ -1782,34 +1437,27 @@ def render_bag(
                 duration=(timestamp_ns - inspection.start_ns) / 1e9,
             )
             if connection.topic == inspection.topics.odometry:
-                robot_from_root = resolver.lookup(
-                    robot_frame,
-                    root_frame,
-                    timestamp_ns,
-                )
-                if not log_trajectory_state(
+                log_trajectory_state(
                     inspection.odometry,
                     timestamp_ns,
                     arguments.history_seconds,
                     arguments.future_seconds,
-                    robot_from_root,
-                ):
-                    warnings[f"robot_frame:{robot_frame}"] += 1
+                )
             elif connection.topic == inspection.topics.pointcloud:
                 points, colors = decode_pointcloud(
                     message,
                     arguments.point_stride,
                 )
                 cloud_frame = canonical_frame_id(message.header.frame_id, aliases)
-                robot_from_cloud = resolver.lookup(
-                    robot_frame,
+                world_from_cloud = resolver.lookup(
+                    root_frame,
                     cloud_frame,
                     timestamp_ns,
                 )
-                if robot_from_cloud is None:
+                if world_from_cloud is None:
                     warnings[f"pointcloud:{cloud_frame}"] += 1
                 else:
-                    points = transform_points(points, robot_from_cloud)
+                    points = transform_points(points, world_from_cloud)
                     rr.log(
                         "world/pointcloud",
                         rr.Points3D(
@@ -1818,39 +1466,6 @@ def render_bag(
                             radii=arguments.point_radius,
                         ),
                     )
-            elif connection.topic in inspection.topics.planned_trajectories:
-                points, trajectory_frame = decode_planned_trajectory(
-                    message,
-                    connection.msgtype,
-                )
-                trajectory_frame = canonical_frame_id(trajectory_frame, aliases)
-                robot_from_trajectory = resolver.lookup(
-                    robot_frame,
-                    trajectory_frame,
-                    timestamp_ns,
-                )
-                if robot_from_trajectory is None:
-                    warnings[f"planned:{connection.topic}:{trajectory_frame}"] += 1
-                elif len(points) >= 2:
-                    centered_points = transform_points(
-                        points,
-                        robot_from_trajectory,
-                    )
-                    color, radius, name = planned_trajectory_style(
-                        connection.topic
-                    )
-                    rr.log(
-                        f"world/planned_trajectories/{name}",
-                        rr.LineStrips3D(
-                            [centered_points],
-                            colors=[color],
-                            radii=radius,
-                            labels=[connection.topic],
-                            show_labels=False,
-                        ),
-                    )
-                else:
-                    warnings[f"planned_too_short:{connection.topic}"] += 1
             elif connection.topic == inspection.topics.rgb:
                 image, semantic = decode_ros_image(message)
                 current_camera_frame = canonical_frame_id(
@@ -1863,7 +1478,7 @@ def render_bag(
                     ] += 1
                 if not log_camera_pose(
                     resolver,
-                    robot_frame,
+                    root_frame,
                     current_camera_frame,
                     timestamp_ns,
                 ):
@@ -1912,8 +1527,6 @@ def print_inspection_report(
     aliases: dict[str, str],
     resolver: FrameResolver,
     synthetic_bridge: tuple[str, str] | None,
-    robot_frame: str,
-    robot_model: RobotModel,
 ) -> None:
     """打印 topic 选择和 TF 修复的可审计报告."""
     duration = (inspection.end_ns - inspection.start_ns) / 1e9
@@ -1932,18 +1545,6 @@ def print_inspection_report(
     ):
         count = inspection.topic_counts.get(topic, 0) if topic else 0
         print(f"  {label}: {topic or 'missing'} ({count})")
-    for topic in PLANNED_TRAJECTORY_TOPICS:
-        msgtype = inspection.topic_types.get(topic)
-        count = inspection.topic_counts.get(topic, 0)
-        status = f"{msgtype}, {count}" if msgtype else "missing"
-        print(f"  planned {topic}: {status}")
-    print("\nRobot-centered 3D view")
-    print(f"  target frame: {robot_frame}")
-    print(f"  URDF: {robot_model.urdf_path}")
-    print(
-        f"  URDF root: {robot_model.root_link}; "
-        f"mesh visuals: {len(robot_model.visuals)}"
-    )
     print("\nSampled sensor frames")
     for topic, frame in sorted(inspection.sampled_frames.items()):
         print(f"  {topic}: {frame or '<empty>'}")
@@ -2023,16 +1624,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--color-info-topic")
     parser.add_argument("--tf-topic")
     parser.add_argument("--tf-static-topic")
-    parser.add_argument(
-        "--robot-frame",
-        help="固定在左侧三维视图原点的 frame；默认使用 Odometry child frame",
-    )
-    parser.add_argument(
-        "--robot-urdf",
-        type=Path,
-        default=DEFAULT_ROBOT_URDF,
-        help="左侧三维视图加载的机器人 URDF",
-    )
     parser.add_argument(
         "--frame-alias",
         action="append",
@@ -2140,23 +1731,11 @@ def run(arguments: argparse.Namespace) -> None:
     )
     if camera_frame is None:
         raise ValueError("无法确定 RGB camera frame")
-    root_frame = canonical_frame_id(inspection.odometry.root_frame, aliases)
-    robot_frame = canonical_frame_id(
-        arguments.robot_frame or inspection.odometry.child_frame,
-        aliases,
-    )
-    if resolver.lookup(robot_frame, root_frame, inspection.start_ns) is None:
-        raise ValueError(
-            f"机器人 frame {robot_frame} 与里程计根 frame {root_frame} 不连通"
-        )
-    robot_model = load_robot_model(arguments.robot_urdf)
     print_inspection_report(
         inspection,
         aliases,
         resolver,
         synthetic_bridge,
-        robot_frame,
-        robot_model,
     )
     if arguments.inspect_only:
         return
@@ -2165,8 +1744,6 @@ def run(arguments: argparse.Namespace) -> None:
         resolver,
         aliases,
         camera_frame,
-        robot_frame,
-        robot_model,
         arguments,
     )
 

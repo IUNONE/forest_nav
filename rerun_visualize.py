@@ -42,6 +42,18 @@ from xml.etree import ElementTree
 FINAL_TOPIC = "/planned_trajectory_final"
 OPT_TOPICS = tuple("/planned_trajectory_opt{}".format(i) for i in range(1, 8))
 PLANNED_TOPICS = (FINAL_TOPIC,) + OPT_TOPICS
+FINAL_TRAJECTORY_COLOR = [255, 240, 45, 255]
+OPT_TRAJECTORY_COLORS = (
+    [70, 120, 200, 140],
+    [50, 150, 160, 140],
+    [80, 150, 100, 140],
+    [130, 100, 180, 140],
+    [160, 90, 140, 140],
+    [170, 115, 70, 140],
+    [120, 130, 145, 140],
+)
+FINAL_TRAJECTORY_RADIUS_M = 0.065
+OPT_TRAJECTORY_RADIUS_M = 0.022
 POINTCLOUD_SCHEMA_NAME = "sensor_msgs/msg/PointCloud2"
 TF_SCHEMA_NAME = "tf2_msgs/msg/TFMessage"
 STRING_SCHEMA_NAME = "std_msgs/msg/String"
@@ -1094,12 +1106,29 @@ def view_main(argv: Optional[Sequence[str]] = None) -> int:
             )
         )
 
+    trajectory_overrides = {
+        FINAL_TOPIC: rr.Points3D.from_fields(
+            colors=FINAL_TRAJECTORY_COLOR,
+            radii=FINAL_TRAJECTORY_RADIUS_M,
+        )
+    }
+    trajectory_overrides.update(
+        {
+            topic: rr.Points3D.from_fields(
+                colors=color,
+                radii=OPT_TRAJECTORY_RADIUS_M,
+            )
+            for topic, color in zip(OPT_TOPICS, OPT_TRAJECTORY_COLORS)
+        }
+    )
+
     blueprint = rrb.Blueprint(
         rrb.Horizontal(
             rrb.Spatial3DView(
                 name="Robot-centered point cloud",
                 origin="/",
                 contents=["/**"],
+                overrides=trajectory_overrides,
                 spatial_information=rrb.SpatialInformation(
                     target_frame=args.robot_frame,
                     show_axes=True,

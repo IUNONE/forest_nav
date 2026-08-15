@@ -1,0 +1,68 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Local environments and secrets
+.venv/
+venv/
+.conda/
+.env
+.env.*
+!.env.example
+
+# Training logs and experiment trackers
+wandb/
+lightning_logs/
+logs/
+events.out.tfevents.*
+*.log
+nohup.out
+
+# Training outputs and model artifacts
+results/
+checkpoints/
+outputs/
+runs/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Local datasets and ROS bag artifacts
+*.h5
+*.hdf5
+*.mcap
+*.db3
+*.bag
+*.npy
+*.npz
+
+# Profiling and crash artifacts
+*.prof
+*.trace
+core
+core.*
+
+# Editor and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# Local coding-agent metadata
+.agents/
+.codex/

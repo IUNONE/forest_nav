@@ -1,0 +1,12 @@
+name: rerun_viz
+
+channels:
+  - conda-forge
+
+dependencies:
+  # Rerun 0.36 requires Python >=3.10. Keep it separate from the Python 3.8
+  # forest_nav training environment so visualization cannot disturb training.
+  - python=3.10
+  - pip
+  - pip:
+      - rerun-sdk==0.36.0

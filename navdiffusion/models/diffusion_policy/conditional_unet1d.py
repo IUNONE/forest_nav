@@ -71,14 +71,36 @@ class ConditionalUnet1D(nn.Module):
         local_cond_dim=None,
         global_cond_dim=None,
         diffusion_step_embed_dim=256,
-        down_dims=[256,512,1024],
+        down_dims=(256, 512, 1024),
+        trajectory_horizon=None,
         kernel_size=3,
         n_groups=8,
         cond_predict_scale=False
         ):
         super().__init__()
+        if len(down_dims) < 2:
+            raise ValueError("down_dims must contain at least two stages")
+        if kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be odd to preserve trajectory length")
+        invalid_group_dims = [dim for dim in down_dims if dim % n_groups != 0]
+        if invalid_group_dims:
+            raise ValueError(
+                "Every down dimension must be divisible by n_groups; invalid: {}".format(
+                    invalid_group_dims
+                )
+            )
         all_dims = [input_dim] + list(down_dims)
         start_dim = down_dims[0]
+        self.trajectory_horizon = trajectory_horizon
+        if trajectory_horizon is not None:
+            if trajectory_horizon < 1:
+                raise ValueError("trajectory_horizon must be positive")
+            self.trajectory_position_embedding = nn.Parameter(
+                torch.empty(1, start_dim, trajectory_horizon)
+            )
+            nn.init.normal_(self.trajectory_position_embedding, std=0.02)
+        else:
+            self.trajectory_position_embedding = None
 
         dsed = diffusion_step_embed_dim
         diffusion_step_encoder = nn.Sequential(
@@ -197,7 +219,7 @@ class ConditionalUnet1D(nn.Module):
         if global_cond is not None:
             global_feature = torch.cat([
                 global_feature, global_cond
-            ], axis=-1)
+            ], dim=-1)
         
         # encode local features
         h_local = list()
@@ -213,6 +235,14 @@ class ConditionalUnet1D(nn.Module):
         h = []
         for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
             x = resnet(x, global_feature)
+            if idx == 0 and self.trajectory_position_embedding is not None:
+                if x.shape[-1] != self.trajectory_horizon:
+                    raise ValueError(
+                        "Expected trajectory horizon {}, got {}".format(
+                            self.trajectory_horizon, x.shape[-1]
+                        )
+                    )
+                x = x + self.trajectory_position_embedding
             if idx == 0 and len(h_local) > 0:
                 x = x + h_local[0]
             x = resnet2(x, global_feature)
@@ -225,11 +255,7 @@ class ConditionalUnet1D(nn.Module):
         for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
             x = torch.cat((x, h.pop()), dim=1)
             x = resnet(x, global_feature)
-            # The correct condition should be:
-            # if idx == (len(self.up_modules)-1) and len(h_local) > 0:
-            # However this change will break compatibility with published checkpoints.
-            # Therefore it is left as a comment.
-            if idx == len(self.up_modules) and len(h_local) > 0:
+            if idx == (len(self.up_modules) - 1) and len(h_local) > 0:
                 x = x + h_local[1]
             x = resnet2(x, global_feature)
             x = upsample(x)
@@ -238,4 +264,3 @@ class ConditionalUnet1D(nn.Module):
 
         x = einops.rearrange(x, 'b t h -> b h t')
         return x
-

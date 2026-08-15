@@ -4,9 +4,6 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 from argparse import ArgumentParser
 
-from navdiffusion.data.transform_utils import project_to_img
-
-
 class H5DataVisualizer:
     
     def __init__(self, h5_path: str):
@@ -62,27 +59,12 @@ class H5DataVisualizer:
             group = f[group_key]
             image = group['image'][:]
             future_waypoint_local = group['future_waypoint_local'][:]
-            goal_local = group['goal_local'][:]
-        
-        # Replace inf values in depth channel with max non-inf value
-        depth_channel = image[:, :, 3]
-        inf_mask = np.isinf(depth_channel)
-        if inf_mask.any():
-            max_valid_depth = depth_channel[~inf_mask].max() if (~inf_mask).any() else 50.0
-            image[:, :, 3][inf_mask] = max_valid_depth
-        
-        return group_key, image, future_waypoint_local, goal_local
+        return group_key, image, future_waypoint_local
     
     def update_display(self):
         """Update the visualization"""
         # Load current sample
-        group_key, image, future_waypoint, goal = self.load_sample(self.current_idx)
-        
-        # Depth channel statistics (output for every frame)
-        depth_channel = image[:, :, 3]
-        print(f"\n[Frame {self.current_idx + 1}/{len(self.group_keys)}] Depth stats:")
-        print(f"  min: {depth_channel.min():.2f}m, max: {depth_channel.max():.2f}m")
-        print(f"  mean: {depth_channel.mean():.2f}m, std: {depth_channel.std():.2f}m")
+        group_key, image, future_waypoint = self.load_sample(self.current_idx)
         
         # Clear axes
         self.ax_img.clear()
@@ -90,36 +72,18 @@ class H5DataVisualizer:
         
         # Display RGB image (first 3 channels)
         rgb_image = image[:, :, :3]
+        if rgb_image.dtype != np.uint8 and rgb_image.max() > 1.0:
+            rgb_image = rgb_image / 255.0
         self.ax_img.imshow(rgb_image)
         
-        # Project future waypoints to image
-        img_coords = project_to_img(future_waypoint[:, :2], debug=(self.current_idx == 0))
-        valid_mask = ~np.isnan(img_coords[:, 0])
-        valid_coords = img_coords[valid_mask]
-        
-        # Debug output for first frame
+        # The bag does not contain the body-to-camera extrinsic, so projecting
+        # body-frame waypoints onto the RGB image would be misleading.
         if self.current_idx == 0:
             print(f"\nDebug info for first frame:")
             print(f"Future waypoints shape: {future_waypoint.shape}")
             print(f"First 3 waypoints (local): {future_waypoint[:3, :2]}")
-            print(f"Projected coords shape: {img_coords.shape}")
-            print(f"Valid points: {valid_mask.sum()}/{len(valid_mask)}")
-            if len(valid_coords) > 0:
-                print(f"Valid coords range - u: [{valid_coords[:, 0].min():.1f}, {valid_coords[:, 0].max():.1f}]")
-                print(f"Valid coords range - v: [{valid_coords[:, 1].min():.1f}, {valid_coords[:, 1].max():.1f}]")
-        
-        # Draw projected waypoints on image
-        if len(valid_coords) > 0:
-            self.ax_img.scatter(valid_coords[:, 0], valid_coords[:, 1], 
-                              c='lime', s=50, marker='o', edgecolors='white', 
-                              linewidths=1.5, zorder=5, alpha=0.8)
-            if self.current_idx == 0:
-                print(f"Drew {len(valid_coords)} waypoints on image")
-        else:
-            if self.current_idx == 0:
-                print("No valid waypoints to draw!")
-        
-        self.ax_img.set_title('RGB Image with Projected Waypoints')
+
+        self.ax_img.set_title('RGB Image')
         self.ax_img.axis('off')
         
         # Plot trajectory
@@ -137,13 +101,13 @@ class H5DataVisualizer:
         self.ax_traj.plot(waypoint_x, waypoint_y, 'g-', alpha=0.6, linewidth=2, label='Future Path')
         self.ax_traj.scatter(waypoint_x, waypoint_y, c='green', s=20, marker='o', zorder=2)
         
-        # Goal position (star marker)
-        self.ax_traj.scatter(goal[0], goal[1], c='red', s=300, marker='*', 
-                            label='Goal', zorder=4, edgecolors='darkred', linewidths=1.5)
-        
-        # Set fixed axis limits
-        self.ax_traj.set_xlim(0, 30)
-        self.ax_traj.set_ylim(-15, 15)
+        # Keep the limits useful for a 3.2 second trajectory while including
+        # any lateral or reverse motion in the selected sample.
+        all_x = np.concatenate(([0.0], waypoint_x))
+        all_y = np.concatenate(([0.0], waypoint_y))
+        margin = 0.5
+        self.ax_traj.set_xlim(all_x.min() - margin, all_x.max() + margin)
+        self.ax_traj.set_ylim(all_y.min() - margin, all_y.max() + margin)
         self.ax_traj.set_aspect('equal')
         self.ax_traj.legend(loc='upper right')
         

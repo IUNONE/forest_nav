@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 import sys
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
@@ -20,6 +21,37 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 from rosbags.highlevel import AnyReader
+
+
+class CompatibleAnyReader(AnyReader):
+    """Read MCAP message definitions from both ROS2 msg dialects.
+
+    Older versions of ``mcap-ros2-support`` use ``===`` as the separator
+    between concatenated message definitions.  The rosbags parser expects the
+    ROS1-style 80-character separator, even though both formats describe the
+    same CDR message.  Normalize only while rosbags builds its typestore so
+    existing generated MCAP files remain readable.
+    """
+
+    def open(self) -> None:
+        import rosbags.highlevel.anyreader as anyreader_module
+
+        original_parser = anyreader_module.get_types_from_msg
+
+        def parse_compatible_message_definition(text: str, name: str):
+            normalized = re.sub(
+                r"^={3,}$",
+                "=" * 80,
+                text,
+                flags=re.MULTILINE,
+            )
+            return original_parser(normalized, name)
+
+        anyreader_module.get_types_from_msg = parse_compatible_message_definition
+        try:
+            super().open()
+        finally:
+            anyreader_module.get_types_from_msg = original_parser
 
 
 NANOSECONDS_PER_SECOND = 1_000_000_000
@@ -947,7 +979,7 @@ def inspect_bag(path: Path, arguments: argparse.Namespace) -> BagInspection:
     """预扫描 bag 并提取 topic, TF, 相机和里程计信息."""
     if not path.exists():
         raise FileNotFoundError(f"bag 路径不存在: {path}")
-    with AnyReader([path]) as reader:
+    with CompatibleAnyReader([path]) as reader:
         topics = discover_topics(reader.connections, arguments)
         connection_by_topic = {
             connection.topic: connection for connection in reader.connections
@@ -1780,7 +1812,7 @@ def render_bag(
     selected_topics.update(inspection.topics.planned_trajectories)
     counters: Counter[str] = Counter()
     warnings: Counter[str] = Counter()
-    with AnyReader([inspection.bag_path]) as reader:
+    with CompatibleAnyReader([inspection.bag_path]) as reader:
         connections = [
             connection
             for connection in reader.connections

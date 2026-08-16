@@ -68,24 +68,24 @@ PLANNED_TOPICS = ("/planned_trajectory_final",) + tuple(
 PATH_SCHEMA_NAME = "nav_msgs/msg/Path"
 PATH_MESSAGE_DEFINITION = """std_msgs/Header header
 geometry_msgs/PoseStamped[] poses
-===
+================================================================================
 MSG: std_msgs/Header
 builtin_interfaces/Time stamp
 string frame_id
-===
+================================================================================
 MSG: geometry_msgs/PoseStamped
 std_msgs/Header header
 geometry_msgs/Pose pose
-===
+================================================================================
 MSG: geometry_msgs/Pose
 geometry_msgs/Point position
 geometry_msgs/Quaternion orientation
-===
+================================================================================
 MSG: geometry_msgs/Point
 float64 x
 float64 y
 float64 z
-===
+================================================================================
 MSG: geometry_msgs/Quaternion
 float64 x
 float64 y

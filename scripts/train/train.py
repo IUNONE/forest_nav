@@ -18,6 +18,17 @@ def main(config, wandb_logger):
         config["data_params"], config["model_params"], split="train"
     )
 
+    use_validation = bool(config["data_params"].get("use_validation", False))
+    val_set = None
+    if use_validation:
+        val_set = NavigationDataset(
+            config["data_params"], config["model_params"], split="val"
+        )
+        if len(val_set) == 0:
+            raise ValueError(
+                "Validation is enabled, but the validation dataset is empty"
+            )
+
     train_workers = train_params["num_workers"]
     train_loader = DataLoader(
         train_set,
@@ -27,11 +38,27 @@ def main(config, wandb_logger):
         drop_last=False,
         persistent_workers=train_workers > 0,
     )
+    val_loader = None
+    if val_set is not None:
+        val_loader = DataLoader(
+            val_set,
+            batch_size=train_params.get("val_batch_size", train_params["batch_size"]),
+            shuffle=False,
+            num_workers=train_workers,
+            drop_last=False,
+            persistent_workers=train_workers > 0,
+        )
 
     print(
         "\033[32m[Successfully built dataset]\033[0m "
-        "train samples: {} (all valid samples, no validation split)".format(
-            len(train_set)
+        "train samples: {} (full dataset){}".format(
+            len(train_set),
+            "; val samples: {} ({:.1%} deterministic subset)".format(
+                len(val_set),
+                len(val_set) / len(train_set) if len(train_set) else 0.0,
+            )
+            if val_set is not None
+            else "",
         )
     )
 
@@ -48,12 +75,19 @@ def main(config, wandb_logger):
         log_every_n_steps=5,
         callbacks=[
             ModelSummary(max_depth=1),
-            ModelCheckpoint(dirpath=train_params["checkpoint_dir"]),
+            ModelCheckpoint(
+                dirpath=train_params["checkpoint_dir"],
+                monitor="val/l2_error" if use_validation else None,
+                mode="min",
+                save_top_k=1,
+                save_last=True,
+            ),
         ],
     )
     trainer.fit(
         model=navdiff,
         train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
     )
 
 

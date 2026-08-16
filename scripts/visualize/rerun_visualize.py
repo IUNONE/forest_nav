@@ -8,7 +8,6 @@ motion, camera geometry, and planned trajectories move in the robot frame.
 from __future__ import annotations
 
 import argparse
-import bisect
 import math
 import sys
 from collections import Counter, defaultdict, deque
@@ -50,7 +49,7 @@ SUPPORTED_PLANNED_TRAJECTORY_TYPES = {
     "nav_msgs/msg/Path",
 }
 DEFAULT_ROBOT_URDF = (
-    Path(__file__).resolve().parent
+    Path(__file__).resolve().parents[2]
     / "assets"
     / "diablo_original"
     / "urdf"
@@ -228,6 +227,14 @@ class FrameResolver:
     def static_edge_keys(self) -> set[tuple[str, str]]:
         """返回当前 TF 图中的静态有向边集合."""
         return set(self._static_edges)
+
+    def dynamic_edge_keys(self) -> set[tuple[str, str]]:
+        """返回当前 TF 图中的动态边集合."""
+        return set(self._dynamic_records)
+
+    def remove_static(self, parent: str, child: str) -> None:
+        """移除一条会遮蔽里程计动态位姿的静态边."""
+        self._static_edges.pop((parent, child), None)
 
     def lookup(
         self,
@@ -1104,7 +1111,10 @@ def build_frame_resolver(
     odometry = inspection.odometry
     root = canonical_frame_id(odometry.root_frame, aliases)
     child = canonical_frame_id(odometry.child_frame, aliases)
-    if (root, child) not in resolver.edge_keys():
+    # Odometry pose is the authoritative time-varying root -> body transform.
+    # A stale/static edge with the same frame pair must not override it.
+    if (root, child) not in resolver.dynamic_edge_keys():
+        resolver.remove_static(root, child)
         for timestamp_ns, position, quaternion in zip(
             odometry.timestamps_ns,
             odometry.positions,
@@ -1581,13 +1591,19 @@ def trajectory_window(
         int(timestamps[index]) - timestamp_ns
     ):
         index -= 1
-    history_start = bisect.bisect_left(
-        timestamps,
-        timestamp_ns - int(history_seconds * NANOSECONDS_PER_SECOND),
+    history_start = int(
+        np.searchsorted(
+            timestamps,
+            timestamp_ns - int(history_seconds * NANOSECONDS_PER_SECOND),
+            side="left",
+        )
     )
-    future_end = bisect.bisect_right(
-        timestamps,
-        timestamp_ns + int(future_seconds * NANOSECONDS_PER_SECOND),
+    future_end = int(
+        np.searchsorted(
+            timestamps,
+            timestamp_ns + int(future_seconds * NANOSECONDS_PER_SECOND),
+            side="right",
+        )
     )
     history = odometry.positions[history_start : index + 1]
     future = odometry.positions[index:future_end]
@@ -1626,16 +1642,20 @@ def log_trajectory_state(
                 show_labels=False,
             ),
         )
-        rr.log(
-            "world/trajectory/future_2s",
-            rr.LineStrips3D(
-                [centered_future],
-                colors=[COLOR_FUTURE],
-                radii=0.035,
-                labels=[f"Future {future_seconds:g} s"],
-                show_labels=False,
-            ),
-        )
+        # Near the end of a bag there may be fewer than two future points.
+        # Do not overwrite the last valid future curve with a one-point line;
+        # otherwise Rerun shows no future trajectory at the end of playback.
+        if len(centered_future) >= 2:
+            rr.log(
+                "world/trajectory/future_2s",
+                rr.LineStrips3D(
+                    [centered_future],
+                    colors=[COLOR_FUTURE],
+                    radii=0.035,
+                    labels=[f"Future {future_seconds:g} s"],
+                    show_labels=False,
+                ),
+            )
         rr.log(
             "world/trajectory/heading",
             rr.Arrows3D(
@@ -1655,16 +1675,17 @@ def log_trajectory_state(
             show_labels=False,
         ),
     )
-    rr.log(
-        "dashboard/top_down/future_2s",
-        rr.LineStrips2D(
-            [future[:, :2]],
-            colors=[COLOR_FUTURE],
-            radii=0.035,
-            labels=[f"Future {future_seconds:g} s"],
-            show_labels=False,
-        ),
-    )
+    if len(future) >= 2:
+        rr.log(
+            "dashboard/top_down/future_2s",
+            rr.LineStrips2D(
+                [future[:, :2]],
+                colors=[COLOR_FUTURE],
+                radii=0.035,
+                labels=[f"Future {future_seconds:g} s"],
+                show_labels=False,
+            ),
+        )
     rr.log(
         "dashboard/top_down/robot",
         rr.Points2D(

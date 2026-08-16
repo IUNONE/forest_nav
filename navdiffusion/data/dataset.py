@@ -94,9 +94,14 @@ class NavigationDataset(Dataset):
         data_config: Dict[str, Any],
         split: str,
     ) -> List[str]:
+        # Keep the training loader on the complete dataset.  Validation is a
+        # deterministic subset of that same dataset, as requested by the
+        # training configuration; it is intentionally not removed from train.
+        if split == "train":
+            return tokens
         if not bool(data_config.get("use_validation", False)):
-            return tokens if split == "train" else []
-        if split not in ("train", "val"):
+            return []
+        if split != "val":
             return tokens
         val_fraction = float(data_config.get("val_fraction", 0.1))
         if not 0.0 < val_fraction < 1.0:
@@ -105,7 +110,9 @@ class NavigationDataset(Dataset):
             return tokens
 
         seed = int(data_config.get("split_seed", 42))
-        split_by_bag = bool(data_config.get("split_by_bag", True))
+        # Token-level sampling gives an actual 10% sample by default.  Bag
+        # grouping remains available for users who explicitly need it.
+        split_by_bag = bool(data_config.get("split_by_bag", False))
         units: Dict[str, List[str]] = {}
         if split_by_bag:
             for token in tokens:
@@ -114,7 +121,7 @@ class NavigationDataset(Dataset):
                     source_bag = source_bag.decode("utf-8")
                 units.setdefault(str(source_bag), []).append(token)
 
-        # A single bag cannot produce a non-empty bag-level train and val split.
+        # A single bag cannot produce a non-empty bag-level validation split.
         if not split_by_bag or len(units) < 2:
             units = {token: [token] for token in tokens}
 
@@ -139,7 +146,7 @@ class NavigationDataset(Dataset):
         selected = [
             token
             for unit_name in unit_names
-            if (unit_name in val_units) == (split == "val")
+            if unit_name in val_units
             for token in units[unit_name]
         ]
         return sorted(selected)

@@ -11,7 +11,12 @@ data_params:
       mean: [0.485, 0.456, 0.406]
       std: [0.229, 0.224, 0.225]
   h5_file_path: /data/zhangshenghong/datasets/forest_nav_rgb_trajectory.h5
-  use_validation: false
+  # Validation samples are drawn deterministically from the full training HDF5.
+  # The train loader still uses every sample; the validation subset overlaps it.
+  use_validation: true
+  val_fraction: 0.1
+  split_seed: 42
+  split_by_bag: false
 
 model_params:
   len_traj_pred: 32   # it should be 2^n
@@ -31,7 +36,8 @@ model_params:
     n_groups: 8
     cond_predict_scale: true
     num_train_timesteps: 100
-    num_inference_steps: 10
+    # Number of denoising steps used by forward(..., batch_future_wpts=None).
+    num_inference_steps: 100
   # Measured valid-label range: x [-0.67, 4.57], y [-0.95, 2.11] metres.
   # Keep margins while ensuring every target remains inside diffusion [-1, 1].
   traj_norm_x: [-1.0, 6.5]

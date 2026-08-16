@@ -56,6 +56,10 @@ class NavDiffsionLightning(L.LightningModule):
                 self.noise_pred_net_param.get("num_diffusion_iters", 10),
             )
         )
+        if self.num_train_timesteps < 1:
+            raise ValueError("num_train_timesteps must be positive")
+        if self.num_inference_steps < 1:
+            raise ValueError("num_inference_steps must be positive")
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=self.num_train_timesteps,
             beta_schedule='squaredcos_cap_v2',
@@ -260,6 +264,28 @@ class NavDiffsionLightning(L.LightningModule):
         )
 
         return diffusion_loss
+
+    def validation_step(self, batch, batch_idx):
+        """Run diffusion inference and report waypoint L2 error in metres."""
+        imgs, future_wpts = batch
+        pred_wpts = self.predict((imgs, future_wpts))
+
+        # Both tensors are in the original metre coordinates here.  This is
+        # the mean Euclidean distance over all predicted waypoints and batch
+        # items, rather than the training-time noise-prediction MSE.
+        l2_error = torch.linalg.vector_norm(
+            pred_wpts - future_wpts, ord=2, dim=-1
+        ).mean()
+        self.log(
+            "val/l2_error",
+            l2_error,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+            batch_size=imgs.shape[0],
+        )
+        return l2_error
 
     def predict(self, batch):
         

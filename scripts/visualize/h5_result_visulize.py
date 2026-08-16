@@ -2,8 +2,9 @@ import h5py
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from glob import glob
+from pathlib import Path
 import yaml
 import torch
 from torchvision import transforms
@@ -14,9 +15,22 @@ from navdiffusion import NavDiffsionLightning
 
 class H5ResultVisualizer:
     
-    def __init__(self, h5_path: str, config_path: str, ckpt_dir: str):
+    def __init__(
+        self,
+        h5_path: str,
+        config_path: str,
+        ckpt_dir: str,
+        png_output: bool = False,
+        png_output_dir: str = 'results/h5_result_png',
+    ):
         self.h5_path = h5_path
         self.current_idx = 0
+        self.png_output = png_output
+        self.png_output_dir = Path(png_output_dir)
+        if self.png_output:
+            self.png_output_dir.mkdir(parents=True, exist_ok=True)
+            # Do not require a display when exporting images.
+            plt.switch_backend('Agg')
         
         # Load config
         with open(config_path, 'r') as f:
@@ -51,7 +65,8 @@ class H5ResultVisualizer:
         
         # Create figure and axes
         self.fig = plt.figure(figsize=(14, 6))
-        self.fig.canvas.manager.set_window_title('H5 Result Visualizer')
+        if not self.png_output and hasattr(self.fig.canvas.manager, 'set_window_title'):
+            self.fig.canvas.manager.set_window_title('H5 Result Visualizer')
         
         # Left subplot for image
         self.ax_img = plt.subplot(1, 2, 1)
@@ -66,20 +81,23 @@ class H5ResultVisualizer:
         self.ax_traj.grid(True, alpha=0.3)
         self.ax_traj.set_aspect('equal')
         
-        # Create buttons
-        ax_prev = plt.axes([0.35, 0.02, 0.1, 0.04])
-        ax_next = plt.axes([0.55, 0.02, 0.1, 0.04])
-        self.btn_prev = Button(ax_prev, 'Previous')
-        self.btn_next = Button(ax_next, 'Next')
-        
-        self.btn_prev.on_clicked(self.prev_sample)
-        self.btn_next.on_clicked(self.next_sample)
-        
-        # Display first sample
-        self.update_display()
-        
-        plt.tight_layout(rect=[0, 0.08, 1, 0.96])
-        plt.show()
+        if self.png_output:
+            self.export_pngs()
+        else:
+            # Create buttons for interactive display mode.
+            ax_prev = plt.axes([0.35, 0.02, 0.1, 0.04])
+            ax_next = plt.axes([0.55, 0.02, 0.1, 0.04])
+            self.btn_prev = Button(ax_prev, 'Previous')
+            self.btn_next = Button(ax_next, 'Next')
+
+            self.btn_prev.on_clicked(self.prev_sample)
+            self.btn_next.on_clicked(self.next_sample)
+
+            # Display first sample.
+            self.update_display()
+
+            plt.tight_layout(rect=[0, 0.08, 1, 0.96])
+            plt.show()
     
     def load_image(self, idx: int):
         """Load and normalize the current RGB observation."""
@@ -147,6 +165,8 @@ class H5ResultVisualizer:
         print(f"\nPredicting trajectory for frame {self.current_idx + 1}/{len(self.group_keys)}...")
         pred_traj, inference_time = self.predict_trajectory(self.current_idx)
         print(f"Inference time: {inference_time*1000:.2f} ms")
+        comparable_gt = future_waypoint[:len(pred_traj), :2]
+        l2_error = np.linalg.norm(pred_traj - comparable_gt, axis=1).mean()
         
         # Clear axes
         self.ax_img.clear()
@@ -194,10 +214,27 @@ class H5ResultVisualizer:
         self.ax_traj.legend(loc='upper right')
         
         # Update main title
-        self.fig.suptitle(f'Group: {group_key}  [{self.current_idx + 1}/{len(self.group_keys)}]', 
-                         fontsize=12, fontweight='bold')
+        self.fig.suptitle(
+            f'Group: {group_key}  [{self.current_idx + 1}/{len(self.group_keys)}]  '
+            f'L2: {l2_error:.3f} m',
+            fontsize=12,
+            fontweight='bold',
+        )
         
         self.fig.canvas.draw()
+        if self.png_output:
+            self.fig.tight_layout(rect=[0, 0, 1, 0.96])
+            output_path = self.png_output_dir / f'sample_{self.current_idx:06d}.png'
+            self.fig.savefig(output_path, dpi=150)
+            print(f"Saved: {output_path}")
+
+    def export_pngs(self):
+        """Run inference for every sample and save one comparison image each."""
+        print(f"Saving PNG results to {self.png_output_dir}")
+        for self.current_idx in range(len(self.group_keys)):
+            self.update_display()
+        plt.close(self.fig)
+        print(f"Saved {len(self.group_keys)} PNG files to {self.png_output_dir}")
     
     def next_sample(self, event):
         """Show next sample"""
@@ -213,6 +250,16 @@ class H5ResultVisualizer:
 
 
 def main():
+    def parse_bool(value):
+        normalized = value.lower()
+        if normalized in {'true', '1', 'yes', 'y', 'on'}:
+            return True
+        if normalized in {'false', '0', 'no', 'n', 'off'}:
+            return False
+        raise ArgumentTypeError(
+            f"invalid boolean value: {value!r}; use true or false"
+        )
+
     parser = ArgumentParser(description='Visualize H5 navigation results with model predictions')
     parser.add_argument('--h5_path', type=str, required=True, 
                        help='Path to converted h5 file')
@@ -220,10 +267,20 @@ def main():
                        help='Path to config file')
     parser.add_argument('--ckpt_dir', type=str, default='results/resnet50_spatial',
                        help='Directory containing checkpoint files')
+    parser.add_argument('--png_output', type=parse_bool, default=False,
+                       help='Save all prediction visualizations as PNG files (true/false)')
+    parser.add_argument('--png_output_dir', type=str, default='results/h5_result_png',
+                       help='Directory for PNG output when --png_output is true')
     
     args = parser.parse_args()
     
-    visualizer = H5ResultVisualizer(args.h5_path, args.config_path, args.ckpt_dir)
+    visualizer = H5ResultVisualizer(
+        args.h5_path,
+        args.config_path,
+        args.ckpt_dir,
+        png_output=args.png_output,
+        png_output_dir=args.png_output_dir,
+    )
 
 
 if __name__ == "__main__":

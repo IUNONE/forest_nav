@@ -91,10 +91,25 @@ python -B scripts/inference_add_topic.py \
   --checkpoint results/resnet50_spatial/epoch=999-step=4000.ckpt
 ```
 
+默认会把 7 条候选轨迹组成一个 batch 推理，避免对同一张图重复执行 7 次模型调用。
+如果使用 CPU，可让多个 MCAP 并行处理，例如 96 线程机器可以尝试：
+
+```bash
+python -B scripts/inference_add_topic.py \
+  --input_dir /data/rosbag2 \
+  --output_dir /data/rosbag2_with_planned \
+  --checkpoint results/resnet50_spatial/epoch=999-step=4000.ckpt \
+  --num-workers 4 \
+  --worker-threads 24
+```
+
+单张 GPU 建议保持 `--num-workers 1`，通过默认的 `--candidate-batch-size 7` 利用 GPU；
+显存不足时可以降低 `--candidate-batch-size` 为 1、2 或 4.
+
 默认每 0.1 秒处理一帧 RGB; 使用 `--sample-interval 0` 可处理每一帧. 可用
 `--seed-base` 修改七条候选轨迹的随机种子起点, 用 `--max-samples` 先限制每个 MCAP
 的测试数量. 目录模式默认按文件名顺序顺序处理；如需单个文件失败后继续，可加
-`--continue-on-error`.
+`--continue-on-error`. 每个 MCAP 处理时会显示基于图像 sample 数量的 tqdm 进度条.
 
 ## visualize
 

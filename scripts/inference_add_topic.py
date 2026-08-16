@@ -26,9 +26,12 @@ names under the output directory.
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import math
+import os
 import random
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +42,7 @@ import numpy as np
 import torch
 import yaml
 from torchvision import transforms
+from tqdm import tqdm
 
 try:
     from mcap.reader import make_reader
@@ -378,6 +382,8 @@ def validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--trajectory-interval must be positive")
     if args.max_samples is not None and args.max_samples < 1:
         raise ValueError("--max-samples must be positive")
+    if not 1 <= args.candidate_batch_size <= len(PLANNED_TOPICS) - 1:
+        raise ValueError("--candidate-batch-size must be between 1 and 7")
 
 
 def load_inference_resources(args: argparse.Namespace) -> InferenceResources:
@@ -430,6 +436,37 @@ def load_inference_resources(args: argparse.Namespace) -> InferenceResources:
         model=model,
         device=device,
     )
+
+
+_DIRECTORY_WORKER_ARGS: argparse.Namespace | None = None
+_DIRECTORY_WORKER_RESOURCES: InferenceResources | None = None
+
+
+def initialize_directory_worker(
+    args_values: dict[str, Any],
+    worker_threads: int,
+) -> None:
+    """Load one model per CPU worker and cap its intra-op thread count."""
+    global _DIRECTORY_WORKER_ARGS, _DIRECTORY_WORKER_RESOURCES
+    if worker_threads > 0:
+        torch.set_num_threads(worker_threads)
+    _DIRECTORY_WORKER_ARGS = argparse.Namespace(**args_values)
+    _DIRECTORY_WORKER_RESOURCES = load_inference_resources(_DIRECTORY_WORKER_ARGS)
+
+
+def process_directory_file_worker(
+    input_path: Path,
+    output_path: Path,
+    progress_position: int,
+) -> tuple[Path, Counter]:
+    """Process one directory-mode MCAP inside a worker process."""
+    if _DIRECTORY_WORKER_ARGS is None or _DIRECTORY_WORKER_RESOURCES is None:
+        raise RuntimeError("Directory worker was not initialized")
+    file_args = argparse.Namespace(**vars(_DIRECTORY_WORKER_ARGS))
+    file_args.input = input_path
+    file_args.output = output_path
+    file_args.progress_position = progress_position
+    return input_path, infer_and_write(file_args, _DIRECTORY_WORKER_RESOURCES)
 
 
 def register_source_message(
@@ -524,13 +561,25 @@ def infer_and_write(
             channel.topic
             for channel in (summary.channels.values() if summary else [])
         }
+        image_message_total: int | None = None
         if summary is None:
-            existing_topics = {
-                channel.topic
-                for _, channel, _ in summary_reader.iter_messages(
-                    log_time_order=False
-                )
+            image_message_total = 0
+            for _, channel, _ in summary_reader.iter_messages(
+                log_time_order=False
+            ):
+                existing_topics.add(channel.topic)
+                if channel.topic == args.image_topic:
+                    image_message_total += 1
+        elif summary.statistics is not None:
+            image_channel_ids = {
+                int(channel.id)
+                for channel in summary.channels.values()
+                if channel.topic == args.image_topic
             }
+            image_message_total = sum(
+                summary.statistics.channel_message_counts.get(channel_id, 0)
+                for channel_id in image_channel_ids
+            )
     overlap = existing_topics.intersection(PLANNED_TOPICS)
     if overlap:
         raise ValueError(
@@ -562,6 +611,13 @@ def infer_and_write(
         source_channel_ids: dict[int, int] = {}
         image_decoder_factory = DecoderFactory()
         next_image_ns = -math.inf
+        progress = tqdm(
+            total=image_message_total,
+            desc=f"{input_path.name} samples",
+            unit="sample",
+            dynamic_ncols=True,
+            position=getattr(args, "progress_position", 0),
+        )
 
         try:
             for schema, channel, message in input_reader.iter_messages(
@@ -584,6 +640,7 @@ def infer_and_write(
                 if channel.topic != args.image_topic:
                     continue
                 stats["image_messages"] += 1
+                progress.update(1)
                 if (
                     args.max_samples is not None
                     and stats["written_samples"] >= args.max_samples
@@ -642,22 +699,65 @@ def infer_and_write(
 
                 predictions: list[np.ndarray] = []
                 with torch.inference_mode():
-                    for option_index in range(1, 8):
-                        seed = (
-                            args.seed_base
-                            + stats["written_samples"] * seed_stride
-                            + option_index
+                    # The seven candidates share the same image condition, so
+                    # denoise them as a batch instead of running seven separate
+                    # forward passes. Each row receives its own seeded initial
+                    # noise, preserving the multi-candidate behavior.
+                    image_condition = model.transformer_encoder(image_tensor)
+                    for batch_start in range(
+                        0, len(PLANNED_TOPICS) - 1, args.candidate_batch_size
+                    ):
+                        option_indices = range(
+                            batch_start + 1,
+                            min(
+                                batch_start + args.candidate_batch_size,
+                                len(PLANNED_TOPICS) - 1,
+                            )
+                            + 1,
                         )
-                        seed_torch(seed)
-                        prediction = model.predict((image_tensor, None))
-                        prediction_np = prediction.detach().cpu().numpy()[0]
-                        if prediction_np.shape != (trajectory_points, 2):
-                            raise ValueError(
-                                "Model prediction has shape {}, expected ({}, 2)".format(
-                                    prediction_np.shape, trajectory_points
+                        initial_noises = []
+                        for option_index in option_indices:
+                            seed = (
+                                args.seed_base
+                                + stats["written_samples"] * seed_stride
+                                + option_index
+                            )
+                            seed_torch(seed)
+                            initial_noises.append(
+                                torch.randn(
+                                    (1, trajectory_points, 2),
+                                    device=device,
+                                    dtype=image_tensor.dtype,
                                 )
                             )
-                        predictions.append(prediction_np.astype(np.float32))
+                        candidate_count = len(initial_noises)
+                        candidate_images = image_tensor.expand(
+                            candidate_count, -1, -1, -1
+                        ).contiguous()
+                        candidate_condition = image_condition.expand(
+                            candidate_count, -1
+                        ).contiguous()
+                        initial_noise = torch.cat(initial_noises, dim=0)
+                        prediction = model.predict(
+                            (candidate_images, None),
+                            initial_noise=initial_noise,
+                            image_cond=candidate_condition,
+                        )
+                        prediction_np = prediction.detach().cpu().numpy()
+                        expected_shape = (
+                            candidate_count,
+                            trajectory_points,
+                            2,
+                        )
+                        if prediction_np.shape != expected_shape:
+                            raise ValueError(
+                                "Model prediction has shape {}, expected {}".format(
+                                    prediction_np.shape, expected_shape
+                                )
+                            )
+                        predictions.extend(
+                            prediction_np.astype(np.float32)
+                        )
 
                 paths = [*predictions, gt_trajectory]
                 for topic, points in zip(PLANNED_TOPICS[1:], paths[:-1]):
@@ -693,6 +793,7 @@ def infer_and_write(
                 stats["written_samples"] += 1
                 last_odom_index = current_odom_index
         finally:
+            progress.close()
             writer.finish()
 
     print(f"Wrote new MCAP: {output_path}")
@@ -750,26 +851,84 @@ def infer_directory(args: argparse.Namespace) -> None:
         f"Found {len(input_paths)} MCAP file(s) under {input_dir}; "
         f"output directory: {output_dir}"
     )
-    # Loading the checkpoint once is important when a directory contains many
-    # bags.  Each file still gets its own odometry/indexing/output state.
-    resources = load_inference_resources(args)
     total_stats: Counter = Counter()
     failures: list[tuple[Path, Exception]] = []
 
-    for index, input_path in enumerate(input_paths, start=1):
+    if args.num_workers < 1:
+        raise ValueError("--num-workers must be positive")
+    if args.worker_threads < 0:
+        raise ValueError("--worker-threads must be non-negative")
+    requested_workers = args.num_workers
+    num_workers = min(requested_workers, len(input_paths))
+    using_cuda = args.device == "cuda" or (
+        args.device == "auto" and torch.cuda.is_available()
+    )
+    if num_workers > 1 and using_cuda:
+        raise ValueError(
+            "Multiple MCAP workers are disabled on one CUDA device; use "
+            "--num-workers 1 and increase --candidate-batch-size instead"
+        )
+
+    tasks = []
+    for index, input_path in enumerate(input_paths):
         relative_path = input_path.relative_to(input_dir)
         output_path = output_dir / relative_path
-        print(f"\n[{index}/{len(input_paths)}] {relative_path} -> {output_path}")
-        file_args = argparse.Namespace(**vars(args))
-        file_args.input = input_path
-        file_args.output = output_path
-        try:
-            total_stats.update(infer_and_write(file_args, resources))
-        except Exception as exc:
-            failures.append((input_path, exc))
-            print(f"Failed: {input_path}: {exc}", file=sys.stderr)
-            if not args.continue_on_error:
-                raise
+        print(f"\n[{index + 1}/{len(input_paths)}] {relative_path} -> {output_path}")
+        tasks.append((input_path, output_path, index))
+
+    if num_workers == 1:
+        # Loading the checkpoint once is important in serial directory mode.
+        resources = load_inference_resources(args)
+        for input_path, output_path, progress_position in tasks:
+            file_args = argparse.Namespace(**vars(args))
+            file_args.input = input_path
+            file_args.output = output_path
+            file_args.progress_position = 0
+            try:
+                total_stats.update(infer_and_write(file_args, resources))
+            except Exception as exc:
+                failures.append((input_path, exc))
+                print(f"Failed: {input_path}: {exc}", file=sys.stderr)
+                if not args.continue_on_error:
+                    raise
+    else:
+        worker_threads = args.worker_threads or max(
+            1, (os.cpu_count() or 1) // num_workers
+        )
+        print(
+            f"Parallel MCAP workers: {num_workers}; "
+            f"PyTorch threads per worker: {worker_threads}"
+        )
+        worker_args = vars(args).copy()
+        worker_futures = []
+        process_context = mp.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=process_context,
+            initializer=initialize_directory_worker,
+            initargs=(worker_args, worker_threads),
+        ) as executor:
+            for input_path, output_path, progress_position in tasks:
+                worker_futures.append(
+                    (
+                        input_path,
+                        executor.submit(
+                            process_directory_file_worker,
+                            input_path,
+                            output_path,
+                            progress_position,
+                        ),
+                    )
+                )
+            for input_path, future in worker_futures:
+                try:
+                    _, stats = future.result()
+                    total_stats.update(stats)
+                except Exception as exc:
+                    failures.append((input_path, exc))
+                    print(f"Failed: {input_path}: {exc}", file=sys.stderr)
+                    if not args.continue_on_error:
+                        raise
 
     print("\nDirectory inference summary:")
     print(f"  processed_files: {len(input_paths) - len(failures)}")
@@ -844,6 +1003,33 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--device",
         choices=("auto", "cpu", "cuda"),
         default="auto",
+    )
+    parser.add_argument(
+        "--candidate-batch-size",
+        type=int,
+        default=7,
+        help=(
+            "Number of seeded trajectory candidates denoised together; "
+            "lower this if memory is limited (default: 7)"
+        ),
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help=(
+            "Directory-mode MCAP worker processes; use 1 on a single GPU, "
+            "2-4 can help on CPU (default: 1)"
+        ),
+    )
+    parser.add_argument(
+        "--worker-threads",
+        type=int,
+        default=0,
+        help=(
+            "PyTorch CPU threads per parallel worker; 0 splits available "
+            "CPU threads automatically"
+        ),
     )
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--overwrite", action="store_true")

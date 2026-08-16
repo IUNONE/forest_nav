@@ -89,34 +89,63 @@ class NavDiffsionLightning(L.LightningModule):
         self.epochs = train_params["max_epochs"]
         self.save_hyperparameters()
 
-    def forward(self, 
-        batch_imgs: torch.Tensor, 
-        batch_future_wpts: torch.Tensor = None
+    def forward(
+        self,
+        batch_imgs: torch.Tensor,
+        batch_future_wpts: torch.Tensor = None,
+        initial_noise: torch.Tensor = None,
+        image_cond: torch.Tensor = None,
     ):
         '''
             - batch_obs_images: [B, 3, H, W]
             - batch_future_wpts: [B, len_traj_pred, 2]
+            - initial_noise: optional [B, len_traj_pred, 2] inference noise
+            - image_cond: optional precomputed [B, embedding_dim] condition
         '''
         bs = batch_imgs.shape[0]
 
-        image_cond = self.transformer_encoder(batch_imgs)
+        if image_cond is None:
+            image_cond = self.transformer_encoder(batch_imgs)
+        elif image_cond.shape[0] != bs:
+            raise ValueError(
+                "image_cond batch size {} does not match images {}".format(
+                    image_cond.shape[0], bs
+                )
+            )
         
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (bs,),
-            device=self.device,
-        ).long()
         if batch_future_wpts is not None:
+            if initial_noise is not None:
+                raise ValueError(
+                    "initial_noise is only supported for inference"
+                )
+            timesteps = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                (bs,),
+                device=self.device,
+            ).long()
             noise = torch.randn_like(batch_future_wpts)
             noisy_action = self.noise_scheduler.add_noise(batch_future_wpts, noise, timesteps)
             noise_pred = self.noise_pred_net(sample=noisy_action, timestep=timesteps, global_cond=image_cond)
         else:
-            naction = torch.randn(
-                (bs, self.len_traj_pred, 2),
-                device=self.device,
-                dtype=image_cond.dtype,
-            )
+            if initial_noise is None:
+                naction = torch.randn(
+                    (bs, self.len_traj_pred, 2),
+                    device=self.device,
+                    dtype=image_cond.dtype,
+                )
+            else:
+                expected_shape = (bs, self.len_traj_pred, 2)
+                if tuple(initial_noise.shape) != expected_shape:
+                    raise ValueError(
+                        "initial_noise has shape {}, expected {}".format(
+                            tuple(initial_noise.shape), expected_shape
+                        )
+                    )
+                naction = initial_noise.to(
+                    device=image_cond.device,
+                    dtype=image_cond.dtype,
+                )
             self.noise_scheduler.set_timesteps(self.num_inference_steps)
             # denoise in k steps
             for k in self.noise_scheduler.timesteps[:]:
@@ -287,11 +316,20 @@ class NavDiffsionLightning(L.LightningModule):
         )
         return l2_error
 
-    def predict(self, batch):
+    def predict(
+        self,
+        batch,
+        initial_noise: torch.Tensor = None,
+        image_cond: torch.Tensor = None,
+    ):
         
         imgs, _ = batch
 
-        pred_wpts, _ = self.forward(imgs)
+        pred_wpts, _ = self.forward(
+            imgs,
+            initial_noise=initial_noise,
+            image_cond=image_cond,
+        )
         pred_wpts = (
             (pred_wpts + 1)
             / 2
